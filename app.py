@@ -1,25 +1,21 @@
+# app.py
 """
-app.py — Advanced Text → Handwriting (Streamlit)
-
-Features
-- A4 output at configurable DPI (default 300)
-- Real notebook page (upload background image or draw ruled lines + margin)
-- Multi-page output (automatically paginates)
-- Realistic messy cursive style with many realism tunables
-- PNG per-page and a multi-page PDF export
-- Well documented and segmented for readability
-
-Usage
-- Place this file in your GitHub repo and deploy to Streamlit Cloud
-- Optionally upload a handwriting-like TTF/OTF and/or a paper background image
+Advanced Handwriting Generator (Streamlit)
+------------------------------------------
+- Uses a fixed realistic paper background image named `lined_paper.png` (placed in repo root)
+  OR accepts an uploaded paper background via the sidebar.
+- Produces A4 output at configurable DPI (default 300 DPI).
+- Multi-page rendering with proper baseline/alignment using font.getmetrics().
+- Realistic variability: per-character jitter, rotation, baseline wobble, pressure, ink spread, smudges.
+- Exports PNG for each page and a single multi-page PDF for printing.
+- Fixes the "half down / clipped letters" problem by aligning glyphs to computed baseline.
 """
 
 import os
 import io
 import math
-import tempfile
 import random
-import textwrap
+import tempfile
 from typing import List, Tuple, Optional
 
 import streamlit as st
@@ -27,558 +23,437 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 import numpy as np
 
 # ----------------------------
-# App metadata & page config
+# App config
 # ----------------------------
-st.set_page_config(page_title="✍️ Text → Handwriting — Advanced", page_icon="✍️", layout="wide")
-st.title("✍️ Text → Handwriting — Advanced (Streamlit)")
+st.set_page_config(page_title="✍️ Handwriting — A4 (Baseline-corrected)", layout="wide")
+st.title("✍️ Handwriting Generator — A4 (Baseline-corrected)")
 st.markdown(
-    """
-Generate high-quality A4 handwriting pages with realistic inconsistency.
-**Use ethically** — do not forge or impersonate.
-"""
+    "Drop a realistic `lined_paper.png` (A4 at 300 DPI preferred) into the repo or upload a background image. "
+    "**Do not use for forgery.**"
 )
 
 # ----------------------------
-# Constants & helpers
+# Utilities: conversions & color
 # ----------------------------
-PAPER_SIZES_MM = {
-    "A4": (210.0, 297.0),
-    "Letter": (216.0, 279.0),
-}
-
-
 def mm_to_px(mm: float, dpi: int) -> int:
-    """Convert millimeters to pixels for a given DPI."""
     return int(round(mm / 25.4 * dpi))
 
-
 def pt_to_px(pt: float, dpi: int) -> int:
-    """Convert points to pixels for a given DPI. (1pt = 1/72 in)"""
     return int(round(pt * dpi / 72.0))
 
-
-def hex_to_rgba_tuple(hex_color: str, alpha: int = 255) -> Tuple[int, int, int, int]:
-    """Convert `#RRGGBB` or `RRGGBB` to an (r,g,b,a) tuple."""
+def hex_to_rgba(hex_color: str, alpha: int = 255) -> Tuple[int, int, int, int]:
     h = hex_color.lstrip("#")
     if len(h) == 3:
-        h = "".join(ch * 2 for ch in h)
-    r = int(h[0:2], 16)
-    g = int(h[2:4], 16)
-    b = int(h[4:6], 16)
+        h = "".join(ch*2 for ch in h)
+    r = int(h[0:2], 16); g = int(h[2:4], 16); b = int(h[4:6], 16)
     return (r, g, b, alpha)
 
-
-def safe_truncate_text(t: str, max_chars=1000000) -> str:
-    """Guard against extremely huge inputs causing memory issues."""
-    if len(t) > max_chars:
-        return t[:max_chars] + "\n\n[TRUNCATED]"
-    return t
-
-
 # ----------------------------
-# Sidebar: user controls
+# Sidebar controls
 # ----------------------------
-st.sidebar.header("Paper / Output settings")
-paper_choice = st.sidebar.selectbox("Paper size", list(PAPER_SIZES_MM.keys()), index=0)
+st.sidebar.header("Paper / Output")
+paper_size = st.sidebar.selectbox("Paper size", ["A4"], index=0)  # we only support A4 here
 dpi = st.sidebar.selectbox("DPI (print quality)", [150, 200, 300, 600], index=2)
-use_paper_bg = st.sidebar.checkbox("Use uploaded paper background image (recommended)", value=True)
-paper_bg_upload = st.sidebar.file_uploader("Upload paper background image (png/jpg) — optional", type=["png", "jpg", "jpeg"])
+st.sidebar.markdown("**Put `lined_paper.png` (A4 at desired DPI) in repo root for best results.**")
+use_repo_bg = st.sidebar.checkbox("Use repo `lined_paper.png` if present", value=True)
+uploaded_bg = st.sidebar.file_uploader("Upload paper background (optional)", type=["png","jpg","jpeg"])
 
-st.sidebar.header("Handwriting style")
-style_choice = st.sidebar.selectbox("Handwriting style", ["Neat Cursive (slightly messy)", "Messy Cursive", "Natural Scribble"])
-# We'll map these to internal presets below
+st.sidebar.header("Handwriting style & font")
+style = st.sidebar.selectbox("Style", ["Neat Cursive (slightly messy)", "Casual Messy Cursive", "Very Scribbled"])
+font_upload = st.sidebar.file_uploader("Upload handwriting TTF/OTF (optional)", type=["ttf","otf"])
+base_font_pt = st.sidebar.slider("Base font size (pt)", 20, 140, 48)
 
-st.sidebar.header("Font & size")
-font_upload = st.sidebar.file_uploader("Upload handwriting font (.ttf/.otf) — optional", type=["ttf", "otf"])
-base_font_pt = st.sidebar.slider("Base font size (pt)", 18, 160, 42)
+st.sidebar.header("Realism & alignment (fixes clipped letters)")
+jitter_px = st.sidebar.slider("Per-character jitter (px)", 0, 20, 4)
+rotation_deg = st.sidebar.slider("Rotation max (deg)", 0.0, 16.0, 6.0)
+baseline_wobble = st.sidebar.slider("Baseline wobble (px)", 0, 18, 4)
+ink_spread_px = st.sidebar.slider("Ink spread/blur (px)", 0, 6, 2)
+smudge_strength = st.sidebar.slider("Smudge intensity (0-1)", 0.0, 1.0, 0.12)
+pressure_variance = st.sidebar.slider("Pressure variance (0-1)", 0.0, 1.0, 0.35)
 
-st.sidebar.header("Ink & appearance")
-ink_color = st.sidebar.color_picker("Ink color", "#1b2a45")  # dark blue by default matching sample
-paper_base_color = st.sidebar.color_picker("Paper base color", "#fbf8f3")
-left_margin_color = st.sidebar.color_picker("Margin guideline color", "#d84f4f")
-draw_margin = st.sidebar.checkbox("Draw left margin line (if not using paper background)", value=True)
-notebook_lines = st.sidebar.checkbox("Draw ruled lines (if not using paper background)", value=True)
-
-st.sidebar.header("Realism & variation (affects speed)")
-jitter_px = st.sidebar.slider("Per-character jitter (px)", 0, 16, 4)
-rotation_deg = st.sidebar.slider("Per-character rotation max (deg)", 0.0, 18.0, 6.0)
-baseline_wobble_px = st.sidebar.slider("Baseline wobble (px)", 0, 14, 3)
-ink_spread_px = st.sidebar.slider("Ink spread / blur (px)", 0, 6, 2)
-smudge_strength = st.sidebar.slider("Smudge intensity (0-1)", 0.0, 1.0, 0.10, step=0.01)
-pressure_variability = st.sidebar.slider("Pressure variability (0-1)", 0.0, 1.0, 0.35, step=0.01)
-
-st.sidebar.header("Layout & paging")
-margin_mm = st.sidebar.slider("Page margin (mm)", 5, 40, 16)
-line_spacing_mult = st.sidebar.slider("Line spacing multiplier", 1.0, 2.0, 1.35, step=0.05)
+st.sidebar.header("Layout & pagination")
+margin_mm = st.sidebar.slider("Page margin (mm)", 5, 40, 18)
+line_spacing = st.sidebar.slider("Line spacing multiplier", 1.0, 2.0, 1.35, step=0.05)
 indent_paragraph = st.sidebar.checkbox("Indent paragraphs", value=True)
-max_pages = st.sidebar.slider("Max pages to generate", 1, 50, 8)
+max_pages = st.sidebar.slider("Max pages", 1, 50, 8)
 
-st.sidebar.header("Preview & generation")
+st.sidebar.header("Preview / Export")
 preview_scale = st.sidebar.slider("Preview scale (0.2 = small)", 0.2, 1.0, 0.45)
-generate_button = st.sidebar.button("✨ Generate Handwriting")
+generate_button = st.sidebar.button("✨ Generate")
 
 # ----------------------------
-# Style presets
+# Preset variables per style
 # ----------------------------
 STYLE_PRESETS = {
-    "Neat Cursive (slightly messy)": {
-        "char_spacing_factor": 0.98,
-        "rotation_factor": 0.6,
-        "smear_probability": 0.04,
-        "double_stroke_prob": 0.18,
-        "random_word_shift": 0.06,
-    },
-    "Messy Cursive": {
-        "char_spacing_factor": 1.05,
-        "rotation_factor": 1.0,
-        "smear_probability": 0.14,
-        "double_stroke_prob": 0.35,
-        "random_word_shift": 0.12,
-    },
-    "Natural Scribble": {
-        "char_spacing_factor": 1.2,
-        "rotation_factor": 1.5,
-        "smear_probability": 0.28,
-        "double_stroke_prob": 0.5,
-        "random_word_shift": 0.18,
-    },
+    "Neat Cursive (slightly messy)": dict(char_spacing_factor=0.96, rotation_factor=0.6, double_stroke_prob=0.18, smear_prob=0.04, vertical_jitter_factor=0.4),
+    "Casual Messy Cursive": dict(char_spacing_factor=1.05, rotation_factor=1.0, double_stroke_prob=0.35, smear_prob=0.12, vertical_jitter_factor=0.8),
+    "Very Scribbled": dict(char_spacing_factor=1.2, rotation_factor=1.4, double_stroke_prob=0.6, smear_prob=0.28, vertical_jitter_factor=1.25),
 }
-
-preset = STYLE_PRESETS[style_choice]
-
+preset = STYLE_PRESETS[style]
 
 # ----------------------------
-# Text input (main)
+# Text input
 # ----------------------------
-st.markdown("### ✏️ Paste / type text to convert to handwriting")
-text_input = st.text_area("Input text", height=360, placeholder="Start typing or paste long form text here...")
-text_input = safe_truncate_text(text_input, max_chars=400000)  # guard memory
+st.markdown("### Input text")
+raw_text = st.text_area("Enter or paste the text you want written (blank lines = paragraph breaks)", height=300)
+raw_text = raw_text.strip()
 
-
 # ----------------------------
-# Font loader (safe)
+# Font loader & metrics helpers
 # ----------------------------
-def load_font(uploaded, size_px: int) -> ImageFont.FreeTypeFont:
-    """
-    Load a font. If user uploaded one, store to a temp file and load.
-    Else try several common fonts; fall back to PIL's default.
-    size_px: pixel size (not pt)
-    """
-    if uploaded:
-        ext = os.path.splitext(uploaded.name)[1]
+def load_font(uploaded_file, size_px):
+    """Load font from uploaded file or fallback to common fonts available in many environments."""
+    if uploaded_file:
+        ext = os.path.splitext(uploaded_file.name)[1]
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            tmp.write(uploaded.read())
+            tmp.write(uploaded_file.read())
             tmp.flush()
-            tmp_path = tmp.name
+            path = tmp.name
         try:
-            f = ImageFont.truetype(tmp_path, size=size_px)
-            return f
-        except Exception:
-            # fallback to default
-            pass
-
-    # Try common fonts that exist on many systems (Streamlit Cloud usually has DejaVu)
-    candidates = ["DejaVuSerif.ttf", "DejaVuSans.ttf", "FreeSerif.ttf", "LiberationSerif-Regular.ttf"]
-    for c in candidates:
+            return ImageFont.truetype(path, size_px)
+        except Exception as e:
+            st.warning(f"Uploaded font could not be loaded: {e}. Falling back.")
+    # Try common fonts
+    candidates = ["DejaVuSerif.ttf", "DejaVuSans.ttf", "LiberationSerif-Regular.ttf"]
+    for name in candidates:
         try:
-            return ImageFont.truetype(c, size=size_px)
+            return ImageFont.truetype(name, size_px)
         except Exception:
             continue
-    # final fallback
     return ImageFont.load_default()
 
-
-# ----------------------------
-# Notebook background drawing
-# ----------------------------
-def build_notebook_background(
-    page_size_px: Tuple[int, int],
-    dpi: int,
-    paper_color_hex: str,
-    left_margin_color_hex: str,
-    draw_margin: bool,
-    notebook_lines: bool,
-    line_spacing_px: int,
-    left_margin_px: int,
-    uploaded_bg: Optional[Image.Image] = None,
-) -> Image.Image:
+def get_font_metrics(font: ImageFont.FreeTypeFont) -> Tuple[int,int]:
     """
-    Returns an RGB PIL Image for the background.
-    If uploaded_bg is provided, resize and use it. Otherwise draw clean paper with ruled lines
-    and a margin.
+    Return ascent and descent in pixels for a given PIL font.
+    ascent: distance above baseline, descent: (positive) distance below baseline.
     """
-    W, H = page_size_px
-
-    if uploaded_bg is not None:
-        # Resize uploaded background to exactly page dimensions preserving aspect (crop/fit)
-        bg = uploaded_bg.convert("RGB")
-        bg = ImageOps.fit(bg, (W, H), method=Image.LANCZOS)
-        return bg
-
-    # Create base paper color
-    base = Image.new("RGB", (W, H), paper_color_hex)
-    draw = ImageDraw.Draw(base)
-
-    # Draw small subtle paper texture (paper-color noise)
-    # We'll add a lightweight per-pixel noise layer to avoid flat look
-    arr = np.asarray(base).astype(np.int16)
-    noise = (np.random.normal(loc=0.0, scale=3.0, size=arr.shape)).astype(np.int16)
-    arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
-    base = Image.fromarray(arr, "RGB")
-    draw = ImageDraw.Draw(base)
-
-    # Notebook lines
-    if notebook_lines:
-        # standard ruled spacing ~ 8 mm (but depends on design). We'll compute line spacing in px.
-        # We get line_spacing_px as input based on the font's line height * multiplier.
-        y = left_margin_px  # start after top margin equal to left margin (visually)
-        line_color = tuple(int(left_margin_color_hex.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
-        # Make the color slightly muted for ruling lines
-        rule_rgb = (max(0, line_color[0] - 80), max(0, line_color[1] - 80), max(0, line_color[2] - 120))
-        # line thickness scaled with DPI
-        thickness = max(1, dpi // 300)
-        for gy in range(left_margin_px, H - left_margin_px, line_spacing_px):
-            draw.line((left_margin_px, gy, W - left_margin_px, gy), fill=(214, 208, 192), width=thickness)
-
-    # Left margin/red line
-    if draw_margin:
-        mx = left_margin_px + int(0.5 * dpi / 72)  # small offset
-        # darker red-ish
+    try:
+        ascent, descent = font.getmetrics()
+        return ascent, descent
+    except Exception:
+        # fallback heuristics
         try:
-            red_rgb = tuple(int(left_margin_color_hex.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+            bbox = font.getbbox("Hg")
+            return bbox[3], abs(bbox[1])
         except Exception:
-            red_rgb = (200, 60, 60)
-        thickness = max(1, int(2 * dpi / 300))
-        draw.line((mx, left_margin_px, mx, H - left_margin_px), fill=red_rgb, width=thickness)
-
-    return base
-
+            return int(font.size * 0.8), int(font.size * 0.2)
 
 # ----------------------------
-# Low-level glyph renderer
+# Paper background loader
 # ----------------------------
-def render_character_glyph(
-    ch: str,
-    font: ImageFont.FreeTypeFont,
-    ink_color_hex: str,
-    pressure: float,
-    stroke_thickness: float,
-) -> Image.Image:
+def load_repo_background_if_exists(page_px: Tuple[int,int]) -> Optional[Image.Image]:
+    # look for 'lined_paper.png' in repo root (app folder)
+    if not use_repo_bg:
+        return None
+    candidates = ["lined_paper.png", "lined_paper.jpg", "lined_paper.jpeg"]
+    for c in candidates:
+        if os.path.exists(c):
+            try:
+                im = Image.open(c).convert("RGB")
+                # Fit/crop to page size
+                return ImageOps.fit(im, page_px, Image.LANCZOS)
+            except Exception:
+                continue
+    return None
+
+def load_background(page_px: Tuple[int,int]) -> Image.Image:
+    # priority: uploaded_bg (sidebar) => repo file => generated blank paper with subtle texture
+    if uploaded_bg is not None:
+        try:
+            uploaded_bg.seek(0)
+            im = Image.open(uploaded_bg).convert("RGB")
+            return ImageOps.fit(im, page_px, Image.LANCZOS)
+        except Exception:
+            st.warning("Uploaded paper background could not be loaded; fallback will be used.")
+    repo_bg = load_repo_background_if_exists(page_px)
+    if repo_bg is not None:
+        return repo_bg
+    # generate subtle textured paper + faint ruled lines (if no background provided)
+    W, H = page_px
+    base = Image.new("RGB", (W, H), "#FBF8F3")
+    # subtle noise
+    arr = np.asarray(base).astype(np.int16)
+    noise = (np.random.normal(0.0, 3.5, arr.shape)).astype(np.int16)
+    arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
+    p = Image.fromarray(arr, "RGB")
+    draw = ImageDraw.Draw(p)
+    # draw faint lines in a pattern similar to notebook (8mm spacing approximated)
+    approx_mm = 8.0
+    spacing = mm_to_px(approx_mm, dpi)
+    line_color = (210, 205, 192)
+    for y in range(int(spacing/2), H, spacing):
+        draw.line((int(margin_px/2), y, W - int(margin_px/2), y), fill=line_color, width=max(1, dpi//300))
+    # left margin
+    mx = int(margin_px * 0.75)
+    draw.line((mx, int(margin_px/2), mx, H - int(margin_px/2)), fill=(220,110,110), width=max(1, dpi//280))
+    return p
+
+# ----------------------------
+# Glyph painter (per character) with baseline alignment fix
+# ----------------------------
+def render_char_to_image(ch: str, font: ImageFont.FreeTypeFont, ink_hex: str, pressure: float, stroke_base: float) -> Image.Image:
     """
-    Render a single character to an RGBA image with simulated pressure (alpha) and thickness.
-    We draw the glyph multiple times with tiny offsets to simulate thicker ink for higher pressure.
+    Render a single character to an RGBA image.
+    We place the glyph inside a padded box so after rotation/blur it won't clip.
+    The glyph is drawn with pressure-dependent alpha & simulated thickness via multiple draws.
     """
-    # Create a minimal image to draw the glyph into
-    # Note: font.getsize is reliable; returns width,height
+    # metrics to choose box size
     try:
         gw, gh = font.getsize(ch)
     except Exception:
-        # fallback
         gw, gh = font.getmask(ch).size
 
-    # add padding for rotation and jitter
-    pad = max(12, int(stroke_thickness * 3) + 6)
-    img_w = gw + pad * 2
-    img_h = gh + pad * 2
-    rgba = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(rgba)
+    pad = max(10, int(stroke_base * 3) + 8)
+    W = gw + pad * 2
+    H = gh + pad * 2
+    layer = Image.new("RGBA", (W, H), (0,0,0,0))
+    draw = ImageDraw.Draw(layer)
 
-    # convert hex color + pressure to alpha
-    base_r, base_g, base_b, _ = hex_to_rgba_tuple(ink_color_hex, 255)
-    alpha = int(220 * (0.5 + 0.5 * pressure))  # pressure affects alpha
-
-    # simulate thicker stroke by drawing glyph multiple times with small random offsets
-    draws = max(1, int(round(stroke_thickness * (0.5 + pressure * 1.5))))
+    r,g,b,_ = hex_to_rgba(ink_hex, 255)
+    # alpha based on pressure; darker when pressure is high
+    alpha = int(200 * (0.45 + 0.55 * pressure))
+    # multiple draws to fake thicker stroke
+    draws = max(1, int(round(stroke_base * (0.8 + pressure * 1.6))))
     for i in range(draws):
-        ox = random.randint(-1, 1)
-        oy = random.randint(-1, 1)
-        draw.text((pad + ox, pad + oy), ch, font=font, fill=(base_r, base_g, base_b, alpha))
+        # tiny offset for naturalness
+        ox = random.randint(-1,1)
+        oy = random.randint(-1,1)
+        draw.text((pad + ox, pad + oy), ch, font=font, fill=(r,g,b,alpha))
 
-    return rgba
+    return layer
 
-
-def apply_ink_spread_to_layer(layer: Image.Image, spread_px: float) -> Image.Image:
-    """
-    Simulate ink spread/bleed by blurring the alpha channel (and optionally darkening).
-    """
+def apply_blur_alpha(layer: Image.Image, spread_px: float) -> Image.Image:
+    """Blur alpha channel to simulate bleeding/ink spread."""
     if spread_px <= 0.5:
         return layer
-    # separate alpha, blur it, and recomposite
     rgba = layer.convert("RGBA")
-    base_rgb = rgba.convert("RGB")
+    rgb = rgba.convert("RGB")
     alpha = rgba.split()[-1]
     blurred_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=spread_px))
-    # Reapply blurred alpha with original color multiply to simulate spread
-    new = Image.new("RGBA", layer.size, (0, 0, 0, 0))
-    new.paste(base_rgb, (0, 0), blurred_alpha)
-    return new
-
+    out = Image.new("RGBA", layer.size, (0,0,0,0))
+    out.paste(rgb, (0,0), blurred_alpha)
+    return out
 
 # ----------------------------
-# High-level page renderer
+# High-level page renderer (multi-page)
 # ----------------------------
-def render_handwritten_pages(
+def render_pages(
     text: str,
     font: ImageFont.FreeTypeFont,
-    paper_image: Image.Image,
-    page_size_px: Tuple[int, int],
+    page_px: Tuple[int,int],
     margin_px: int,
-    ink_color_hex: str,
-    dpi: int,
-    base_line_height_px: int,
     line_spacing_mult: float,
-    preset: dict,
+    ink_hex: str,
+    dpi: int,
     jitter_px: int,
     rotation_deg: float,
-    baseline_wobble_px: int,
+    baseline_wobble: int,
     ink_spread_px: int,
     smudge_strength: float,
-    pressure_variability: float,
+    pressure_variance: float,
     indent_paragraph: bool,
+    preset: dict,
     max_pages: int,
+    paper_image: Image.Image,
 ) -> List[Image.Image]:
     """
-    Create one or more PIL Image pages containing the hand-drawn-like text.
-    Algorithm:
-      - Break text into paragraphs and words
-      - Place characters one-by-one with randomized position/rotation/pressure
-      - If a character hits right margin, wrap to next line
-      - If bottom margin exceeded, start a new page
-      - After text is placed, post-process each page with ink spread, smudges, tone
+    Render the entire text into one or more pages.
+    Baseline fix strategy:
+      - Use font.getmetrics() to compute ascent & descent.
+      - The baseline for each line is set so that glyphs with ascenders / descenders do not clip.
+      - When pasting a glyph layer (which contains padding), compute the top Y such that:
+          paste_y = baseline_y - ascent - pad
     """
-
-    W, H = page_size_px
+    W, H = page_px
     pages: List[Image.Image] = []
-    text = text.replace("\r\n", "\n").rstrip("\n")
-    paragraphs = text.split("\n\n")  # blank-line separated paragraphs
 
-    # Clone background for page image
-    def new_page():
-        return paper_image.copy()
+    if not text:
+        return [paper_image.copy()]
 
-    cur_page = new_page()
-    draw_page = ImageDraw.Draw(cur_page)
+    # split paragraphs; double newline indicates paragraph break
+    paragraphs = [p for p in text.split("\n\n")]
 
-    # Compute usable area
-    usable_w = W - 2 * margin_px
-    usable_h = H - 2 * margin_px
+    # get font metrics
+    ascent, descent = get_font_metrics(font)
+    # font internal recommended line height
+    base_line_height = ascent + descent
+    if base_line_height < 10:
+        base_line_height = int(font.size * 1.25)
 
-    # Starting cursor (x,y)
+    # Effective line height with multiplier
+    line_height = int(round(base_line_height * line_spacing_mult))
+
+    usable_w = W - 2*margin_px
+    usable_h = H - 2*margin_px
+
+    # prepare first page
+    current_page = paper_image.copy()
     cursor_x = margin_px
-    cursor_y = margin_px
-
-    # Base metrics
-    font_line_height = base_line_height_px
-    # effective line height
-    line_height = int(round(font_line_height * line_spacing_mult))
-
-    # Optional top offset so lines align nicely with top ruled line
-    # We'll snap to the first ruled line by adjusting cursor_y a bit when using drawn lines.
-    # For uploaded background, we cannot detect lines — we keep margin-based start.
-
-    # If indent enabled, use a tab-size indent in px
-    indent_px = int(font_line_height * 1.0) if indent_paragraph else 0
-
-    # Safeguard against infinite loops
+    cursor_y = margin_px  # this will represent the top of the line box, baseline will be computed from it
     pages_generated = 0
 
-    # Word wrapping helper — but we place char by char for realism
-    def measure_word_px(word: str) -> int:
-        try:
-            return font.getsize(word)[0]
-        except Exception:
-            return font.getmask(word).size[0]
+    def new_page():
+        nonlocal current_page, cursor_x, cursor_y, pages_generated
+        pages.append(current_page)
+        pages_generated += 1
+        current_page = paper_image.copy()
+        cursor_x = margin_px
+        cursor_y = margin_px
 
-    # iterate paragraphs
-    for para_idx, para in enumerate(paragraphs):
+    # helpers to measure plain word width using font
+    def measure_text_px(t: str) -> int:
+        try:
+            return font.getsize(t)[0]
+        except Exception:
+            return font.getmask(t).size[0]
+
+    # place function for single glyph with baseline alignment
+    def paste_glyph(page: Image.Image, glyph_img: Image.Image, baseline_y: int, pad: int, paste_x: int, paste_extra_y: int = 0):
+        # glyph_img was rendered with padding pad; to align baseline:
+        # glyph_top_y = baseline_y - ascent - pad + paste_extra_y
+        top_y = int(round(baseline_y - ascent - pad + paste_extra_y))
+        # If glyph would go out of bottom, we signal for a wrap / new page externally
+        page.paste(glyph_img, (int(paste_x), int(top_y)), glyph_img)
+
+    # iterate paragraphs and words
+    for pidx, para in enumerate(paragraphs):
         if pages_generated >= max_pages:
             break
-        para = para.strip("\n")
-        # handle empty paragraph
-        if para.strip() == "":
-            cursor_y += int(line_height * 0.5)
+        para = para.replace("\r\n", "\n").strip()
+        if para == "":
+            # blank paragraph -> vertical gap
+            cursor_y += int(line_height * 0.6)
             if cursor_y + line_height > margin_px + usable_h:
-                # new page
-                pages.append(cur_page)
-                pages_generated += 1
-                if pages_generated >= max_pages:
-                    break
-                cur_page = new_page()
-                draw_page = ImageDraw.Draw(cur_page)
-                cursor_y = margin_px
-                cursor_x = margin_px
+                new_page()
             continue
 
         words = para.split(" ")
-        # Indent first line
-        first_line = True
-        for widx, word in enumerate(words):
-            # The space after the word (unless last)
-            space_after = " " if widx < len(words) - 1 else ""
-            full_word = word + space_after
+        first_word_of_line = True
+        # apply paragraph indent
+        para_indent_px = int(base_line_height * 1.0) if indent_paragraph else 0
 
-            # Pre-measure to see if it fits in remaining width — but we will place char-by-char;
-            # if the pre-measure doesn't fit, break to next line.
-            word_px = measure_word_px(full_word)
-            if cursor_x + word_px > margin_px + usable_w:
-                # Move to next line
-                cursor_x = margin_px
-                cursor_y += line_height
-                first_line = False
-                if cursor_y + line_height > margin_px + usable_h:
-                    pages.append(cur_page)
-                    pages_generated += 1
-                    if pages_generated >= max_pages:
-                        break
-                    cur_page = new_page()
-                    draw_page = ImageDraw.Draw(cur_page)
-                    cursor_y = margin_px
-                    cursor_x = margin_px
+        for widx, word in enumerate(words):
             if pages_generated >= max_pages:
                 break
+            spacer = " " if widx < len(words)-1 else ""
+            full_word = word + spacer
+            word_px = measure_text_px(full_word)
 
-            # If it's the first line and indent is enabled and at start, add indent
-            if first_line and indent_paragraph and cursor_x == margin_px:
-                cursor_x += indent_px
+            # If word doesn't fit on current line, wrap
+            if cursor_x + word_px > margin_px + usable_w and not first_word_of_line:
+                # new line
+                cursor_x = margin_px
+                cursor_y += line_height
+                first_word_of_line = True
+                if cursor_y + line_height > margin_px + usable_h:
+                    new_page()
+                    if pages_generated >= max_pages:
+                        break
 
-            # Place each character in the full_word
+            # for first line of paragraph, if at line start, add indent
+            if first_word_of_line and para_indent_px > 0 and cursor_x == margin_px:
+                cursor_x += para_indent_px
+
+            # Place word character-by-character to allow jitter and rotation
             for ci, ch in enumerate(full_word):
                 if pages_generated >= max_pages:
                     break
+                # Pressure simulation
+                pressure = max(0.08, min(1.0, random.random() * pressure_variance + (1.0 - pressure_variance)))
+                stroke_base = 1.0 + pressure * 1.2
 
-                # Variations: pressure, jitter, rotation
-                pressure = max(0.1, min(1.0, random.random() * pressure_variability + (1.0 - pressure_variability)))
-                stroke_thickness = 1.0 + pressure * 1.5  # base thickness
-                glyph = render_character_glyph(ch, font, ink_color, pressure, stroke_thickness)
+                # Render glyph to image (with padding)
+                glyph = render_char_to_image(ch, font, ink_color, pressure, stroke_base)
+                # apply ink spread on glyph-level
+                glyph = apply_blur_alpha(glyph, spread_px=ink_spread_px * (0.5 + pressure*0.6))
 
-                # Optionally apply ink spread to the glyph layer
-                glyph = apply_ink_spread_to_layer(glyph, spread_px=ink_spread_px * (0.5 + pressure))
-
-                # Choose random jitter and rotation per glyph
-                jx = int(round(random.uniform(-jitter_px, jitter_px) * (0.6 + random.random() * preset["char_spacing_factor"])))
-                jy = int(round(random.uniform(-baseline_wobble_px, baseline_wobble_px)))
+                # random jitter/rotation / vertical shift
+                jx = int(round(random.uniform(-jitter_px, jitter_px) * (0.6 + random.random()*preset["char_spacing_factor"])))
+                jy = int(round(random.uniform(-baseline_wobble, baseline_wobble) * (preset["vertical_jitter_factor"])))
                 rot = random.uniform(-rotation_deg, rotation_deg) * preset["rotation_factor"]
 
-                # Random vertical "word shift" for messy look
-                word_shift = int(round(random.uniform(-1, 1) * preset["random_word_shift"] * font_line_height))
-                jy += word_shift
-
-                # Rotate glyph
+                # rotate glyph (expand=True so it doesn't crop)
                 glyph = glyph.rotate(rot, resample=Image.BICUBIC, expand=True)
 
-                # Compute paste position (accounting for glyph padding)
-                # The glyph image has internal padding; we paste so that its left aligns with cursor_x + jx
-                # We also adjust y by -pad to keep it on baseline. We will use the glyph height to align baseline.
-                gw, gh = glyph.size
-                paste_x = cursor_x + jx
-                paste_y = cursor_y + jy
+                # After rotation, glyph has different pad; approximate pad used when rendering original
+                # We used pad inside render_char_to_image. Let's inspect glyph size to compute paste.
+                pad = max(10, int(stroke_base * 3) + 8)
 
-                # If pasting would overflow right edge, wrap
-                if paste_x + gw > margin_px + usable_w:
+                # compute baseline Y (we align baseline to the same baseline for that line)
+                baseline_y = cursor_y + ascent  # cursor_y is the top of the line box; baseline = top + ascent
+
+                # if placing this glyph would overflow right edge, wrap before placing
+                if cursor_x + glyph.size[0] > margin_px + usable_w:
+                    # wrap
                     cursor_x = margin_px
                     cursor_y += line_height
-                    paste_x = cursor_x + jx
-                    paste_y = cursor_y + jy
-                    first_line = False
+                    baseline_y = cursor_y + ascent
                     if cursor_y + line_height > margin_px + usable_h:
-                        pages.append(cur_page)
-                        pages_generated += 1
+                        new_page()
                         if pages_generated >= max_pages:
                             break
-                        cur_page = new_page()
-                        draw_page = ImageDraw.Draw(cur_page)
-                        cursor_y = margin_px
-                        cursor_x = margin_px
-                        paste_x = cursor_x + jx
-                        paste_y = cursor_y + jy
 
-                # Paste the glyph (RGBA paste uses glyph alpha)
-                try:
-                    cur_page.paste(glyph, (int(paste_x), int(paste_y)), glyph)
-                except Exception:
-                    # fallback: paste without mask
-                    cur_page.paste(glyph, (int(paste_x), int(paste_y)))
+                # paste glyph with extra jitter added to vertical position
+                paste_extra_y = jy
+                paste_x = cursor_x + jx
 
-                # Advance cursor_x by glyph width scaled by spacing factor and a small randomness
-                advance = max(1, int((gw * 0.7) * (1.0 + random.uniform(-0.06, 0.06)) * preset["char_spacing_factor"]))
+                paste_glyph(current_page, glyph, baseline_y, pad, paste_x, paste_extra_y)
+
+                # advance cursor_x — base on glyph width scaled with spacing factor and a bit randomness
+                advance = max(1, int((glyph.size[0] * 0.75) * (1.0 + random.uniform(-0.06, 0.06)) * preset["char_spacing_factor"]))
                 cursor_x += advance
 
-            # small extra space after word (already included as space char)
-            # continue to next word
+            first_word_of_line = False
 
-            first_line = False
-
-        # After paragraph, move to next line
+        # After paragraph, line break
         cursor_x = margin_px
         cursor_y += line_height
-
-        # new page if needed
         if cursor_y + line_height > margin_px + usable_h:
-            pages.append(cur_page)
-            pages_generated += 1
-            if pages_generated >= max_pages:
-                break
-            cur_page = new_page()
-            draw_page = ImageDraw.Draw(cur_page)
-            cursor_x = margin_px
-            cursor_y = margin_px
+            new_page()
 
-    # Append final page if any text has been drawn into it (or if no pages yet)
+    # make sure to append the last page
     if pages_generated < max_pages:
-        pages.append(cur_page)
+        pages.append(current_page)
         pages_generated += 1
 
-    # Limit to max_pages
-    pages = pages[:max_pages]
-
-    # Post-process pages: overall ink blur/spread and smudges
+    # Post-process pages: ink blur, smudges, paper grain (subtle)
     processed_pages: List[Image.Image] = []
-    for p in pages:
-        # Convert to RGBA for composite effects
+    for p in pages[:max_pages]:
         p_rgba = p.convert("RGBA")
-
-        # Lightly blur / blend to simulate paper absorption; controlled by ink_spread_px
+        # global blur/soften for ink spread
         if ink_spread_px > 0:
             blurred = p_rgba.filter(ImageFilter.GaussianBlur(radius=ink_spread_px * 0.4))
-            # blend the blurred with original to soften edges a bit
-            p_rgba = Image.blend(p_rgba, blurred, alpha=0.18)
+            p_rgba = Image.blend(p_rgba, blurred, alpha=0.10)
 
-        # Add smudges: small translucent blobs of ink blurred
+        # add smudge layer
         if smudge_strength > 0:
-            smudge_layer = Image.new("RGBA", p_rgba.size, (0, 0, 0, 0))
-            sd = int(max(1, smudge_strength * 8))
+            sm_layer = Image.new("RGBA", p_rgba.size, (0,0,0,0))
+            sd = ImageDraw.Draw(sm_layer)
             Wp, Hp = p_rgba.size
-            # Number of smudges proportional to smudge_strength and page size
             n_smudges = int(1 + smudge_strength * 12)
-            smd = ImageDraw.Draw(smudge_layer)
             for _ in range(n_smudges):
                 rx = random.randint(0, Wp)
                 ry = random.randint(0, Hp)
                 r = int(max(6, min(Wp, Hp) * (0.01 + random.random() * 0.03 * smudge_strength)))
-                alpha = int(40 * smudge_strength * random.random())
-                # draw an elliptical smudge
-                color = hex_to_rgba_tuple(ink_color, alpha)[0:3] + (alpha,)
-                smd.ellipse([rx - r, ry - r, rx + r, ry + r], fill=color)
-            smudge_layer = smudge_layer.filter(ImageFilter.GaussianBlur(radius=3 * smudge_strength + 0.5))
-            p_rgba = Image.alpha_composite(p_rgba, smudge_layer)
+                alpha = int(28 * smudge_strength * random.random())
+                c = hex_to_rgba(ink_color, alpha)
+                sd.ellipse([rx-r, ry-r, rx+r, ry+r], fill=c)
+            sm_layer = sm_layer.filter(ImageFilter.GaussianBlur(radius=3 * smudge_strength + 0.5))
+            p_rgba = Image.alpha_composite(p_rgba, sm_layer)
 
-        # Slightly add paper grain using a light noise overlay
-        grain = Image.effect_noise(p_rgba.size, 6.0)
-        grain = grain.convert("L").resize(p_rgba.size)
-        grain = ImageOps.colorize(grain, black="#ffffff", white="#000000")
-        grain = Image.blend(p_rgba.convert("RGB"), grain.convert("RGB"), alpha=0.02)
-        p_final = Image.blend(p_rgba.convert("RGB"), grain, alpha=0.02)
-
+        # subtle paper grain
+        arr = np.asarray(p_rgba.convert("RGB")).astype(np.float32)
+        grain = (np.random.normal(0.0, 1.2, arr.shape)).astype(np.float32)
+        arr = np.clip(arr + grain, 0, 255).astype(np.uint8)
+        p_final = Image.fromarray(arr, "RGB")
         processed_pages.append(p_final)
 
     return processed_pages
 
-
 # ----------------------------
-# Multi-page PDF exporter
+# PDF helper
 # ----------------------------
-def pages_to_multi_pdf_bytes(pages: List[Image.Image]) -> bytes:
-    """Return bytes of a multi-page PDF built from pages (PIL Images)."""
+def pages_to_pdf_bytes(pages: List[Image.Image]) -> bytes:
     if not pages:
         return b""
     rgb_pages = [p.convert("RGB") for p in pages]
@@ -589,134 +464,105 @@ def pages_to_multi_pdf_bytes(pages: List[Image.Image]) -> bytes:
         rgb_pages[0].save(out, format="PDF", save_all=True, append_images=rgb_pages[1:])
     return out.getvalue()
 
-
 # ----------------------------
-# Main generation trigger
+# Main generate action
 # ----------------------------
 if generate_button:
-    if not text_input.strip():
-        st.error("Please enter some text to render.")
+    if not raw_text:
+        st.error("Please enter the text to render.")
     else:
-        with st.spinner("Rendering high-quality handwriting pages — this may take a few seconds..."):
-            # Compute page size in pixels
-            W_px = mm_to_px(PAPER_SIZES_MM[paper_choice][0], dpi)
-            H_px = mm_to_px(PAPER_SIZES_MM[paper_choice][1], dpi)
-            page_size_px = (W_px, H_px)
+        # A4 mm dims
+        A4_mm = (210.0, 297.0)
+        W_px = mm_to_px(A4_mm[0], dpi)
+        H_px = mm_to_px(A4_mm[1], dpi)
+        page_px = (W_px, H_px)
 
-            # Convert base font pt to px for given DPI
-            font_size_px = pt_to_px(base_font_pt, dpi)
+        # margin in px
+        margin_px = mm_to_px(margin_mm, dpi)
 
-            # Load font
-            pil_font = load_font(font_upload, font_size_px)
+        # compute font pixel size from pt
+        font_px = pt_to_px(base_font_pt, dpi)
+        font = load_font(font_upload, font_px)
 
-            # Base line height — use font metrics where available
-            try:
-                # font.getsize returns (w,h)
-                sample_w, sample_h = pil_font.getsize("Hg")
-                base_line_height_px = max(sample_h, int(font_size_px * 1.05))
-            except Exception:
-                base_line_height_px = int(font_size_px * 1.25)
+        # compute ascent/descent, line_height
+        ascent, descent = get_font_metrics(font)
+        base_line_height = ascent + descent
+        if base_line_height < 8:
+            base_line_height = int(font_px * 1.25)
 
-            # Left margin
-            margin_px = mm_to_px(margin_mm, dpi)
+        # prepare paper background
+        # first try repo file if user asked for that
+        paper_img = load_background(page_px)
 
-            # Create or load paper background
-            uploaded_bg_img = None
-            if use_paper_bg and paper_bg_upload is not None:
-                try:
-                    uploaded_bg_img = Image.open(io.BytesIO(paper_bg_upload.read()))
-                except Exception:
-                    uploaded_bg_img = None
-
-            paper_img = build_notebook_background(
-                page_size_px=page_size_px,
-                dpi=dpi,
-                paper_color_hex=paper_base_color,
-                left_margin_color_hex=left_margin_color,
-                draw_margin=draw_margin,
-                notebook_lines=notebook_lines,
-                line_spacing_px=int(round(base_line_height_px * line_spacing_mult)),
-                left_margin_px=margin_px,
-                uploaded_bg=uploaded_bg_img,
-            )
-
-            # Finally render pages
-            pages = render_handwritten_pages(
-                text=text_input,
-                font=pil_font,
-                paper_image=paper_img,
-                page_size_px=page_size_px,
+        # finally render pages
+        with st.spinner("Rendering pages — this can take a few seconds depending on DPI & length..."):
+            pages = render_pages(
+                text=raw_text,
+                font=font,
+                page_px=page_px,
                 margin_px=margin_px,
-                ink_color_hex=ink_color,
+                line_spacing_mult=line_spacing,
+                ink_hex="#1b2a45",  # default dark blue
                 dpi=dpi,
-                base_line_height_px=base_line_height_px,
-                line_spacing_mult=line_spacing_mult,
-                preset=preset,
                 jitter_px=jitter_px,
                 rotation_deg=rotation_deg,
-                baseline_wobble_px=baseline_wobble_px,
+                baseline_wobble=baseline_wobble,
                 ink_spread_px=ink_spread_px,
                 smudge_strength=smudge_strength,
-                pressure_variability=pressure_variability,
+                pressure_variance=pressure_variance,
                 indent_paragraph=indent_paragraph,
+                preset=preset,
                 max_pages=max_pages,
+                paper_image=paper_img,
             )
 
-            # Present preview and downloads
-            st.success(f"Rendered {len(pages)} page(s).")
+        st.success(f"Rendered {len(pages)} page(s).")
 
-            # Layout: preview on left, controls on right
-            col_left, col_right = st.columns([2, 1])
-            with col_left:
-                st.subheader("Preview (scaled)")
+        # Show preview & downloads
+        left_col, right_col = st.columns([2,1])
+        with left_col:
+            st.subheader("Preview (scaled)")
+            for i, p in enumerate(pages):
+                sw = int(p.size[0] * preview_scale)
+                sh = int(p.size[1] * preview_scale)
+                preview = p.resize((sw, sh), Image.LANCZOS)
+                st.image(preview, caption=f"Page {i+1}", use_column_width=False)
+
+        with right_col:
+            st.subheader("Downloads")
+            # Single PNG first page
+            buf0 = io.BytesIO()
+            pages[0].save(buf0, format="PNG")
+            st.download_button("⬇️ Download Page 1 PNG", buf0.getvalue(), "handwritten_page_1.png", "image/png")
+            # Per-page PNGs (if not too many)
+            if len(pages) <= 12:
                 for i, p in enumerate(pages):
-                    # scaled preview
-                    sw = int(p.size[0] * preview_scale)
-                    sh = int(p.size[1] * preview_scale)
-                    preview_img = p.resize((sw, sh), Image.LANCZOS)
-                    st.image(preview_img, caption=f"Page {i+1}", use_column_width=False)
-
-            with col_right:
-                st.subheader("Download options")
-                # Single page PNG (first)
-                buf0 = io.BytesIO()
-                pages[0].save(buf0, format="PNG")
-                st.download_button("⬇️ Download Page 1 PNG", buf0.getvalue(), "handwritten_page_1.png", "image/png")
-
-                # Per-page PNG downloads (if few pages)
-                if len(pages) <= 12:
-                    for i, p in enumerate(pages):
-                        b = io.BytesIO()
-                        p.save(b, format="PNG")
-                        st.download_button(f"PNG: Page {i+1}", b.getvalue(), f"handwritten_page_{i+1}.png", "image/png")
-
-                # Multi-page PDF
-                pdf_bytes = pages_to_multi_pdf_bytes(pages)
-                st.download_button("⬇️ Download multi-page PDF", pdf_bytes, "handwritten_pages.pdf", "application/pdf")
-
-                # Offer a small info block with recommended settings for print
-                st.markdown(
-                    """
-                    **Recommended for printing**
-                    - DPI: 300 (default) or 600 for high detail.
-                    - Preview scale: reduce so the browser stays responsive.
-                    - If you plan to print, download the multi-page PDF.
-                    """
-                )
+                    b = io.BytesIO()
+                    p.save(b, format="PNG")
+                    st.download_button(f"PNG: Page {i+1}", b.getvalue(), f"handwritten_page_{i+1}.png", "image/png")
+            # Multi-page PDF
+            pdf_bytes = pages_to_pdf_bytes(pages)
+            st.download_button("⬇️ Download multi-page PDF", pdf_bytes, "handwritten_pages.pdf", "application/pdf")
+            st.markdown("**Tips:** Use 300 DPI for print. For higher fidelity use 600 DPI but it will be slower and use more memory.")
 
 # ----------------------------
-# Tips and Ethics reminder
+# Footer: help & tips
 # ----------------------------
 st.markdown("---")
 st.markdown(
     """
-### Tips to improve realism
-- Upload a handwriting-like TTF font for even better results. Combine that with `jitter`, `rotation`, and `ink spread`.
-- Increase DPI to 600 for very high quality (note: generation will be slower).
-- Slightly increase `smudge` and `ink spread` to mimic pen-bleed on porous paper.
-- If you want a particular person's style, the correct approach is to practice/collect samples and train a model — do not impersonate.
+**Why this avoids the 'half down / clipped' problem**
+- We compute `ascent` and `descent` via `font.getmetrics()` and set the line baseline as `cursor_y + ascent`.
+- Each glyph image is created with internal padding and pasted with `paste_y = baseline - ascent - pad`.
+  This ensures ascenders & descenders have room and won't be clipped.
+  
+**Best practice**
+- Provide a high-quality `lined_paper.png` in the repo root that is at least A4@300DPI (2480×3508 px).
+  Name it exactly `lined_paper.png`.
+- Upload a handwriting `.ttf` for best, most realistic results.
+- Tweak `jitter`, `rotation`, `baseline wobble`, `ink spread` & `smudge` sliders to achieve the desired realism.
 
-**Ethics & legality**: generating handwriting is for creative and legitimate uses (mockups, art, practice). **Do not use** this tool to forge signatures, impersonate people, or misrepresent official documents.
+**Ethics:** This tool is for creative uses only. Do not use it for forgery, impersonation, or illegal documents.
 """
 )
 
